@@ -1,0 +1,340 @@
+# routes/paystack.py
+from datetime import datetime
+import uuid
+import json
+import hmac
+import hashlib
+import os
+import requests
+
+from fastapi import APIRouter, HTTPException, Request, Header
+from pydantic import BaseModel
+from datetime import datetime
+from pydantic import BaseModel
+from pymongo import MongoClient, ReturnDocument
+from db.db import transactions_collection, wallets_collection, users_collection, db, client
+
+
+# ==========================================================
+# ROUTER
+# ==========================================================
+
+router = APIRouter(prefix="/payments/paystack", tags=["Paystack"])
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+PAYSTACK_SECRET_KEY = os.getenv(
+    "PAYSTACK_SECRET_KEY",
+    "sk_test_677b67f15466371d963b78e85c11228acbdeed2f",
+)
+
+PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
+PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify/"
+
+HEADERS = {
+    "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+    "Content-Type": "application/json",
+}
+
+# ==========================================================
+# DATABASE
+# ==========================================================
+
+# client = MongoClient("mongodb://localhost:27017")
+# db = client["paying_app"]
+
+# wallets_collection = db["wallets"]
+# transactions_collection = db["transactions"]
+
+# Idempotency
+transactions_collection.create_index("reference", unique=True)
+
+# ==========================================================
+# SCHEMAS
+# ==========================================================
+
+class PaystackInitRequest(BaseModel):
+    amount: float
+    email: str
+    user_id: str
+
+# ==========================================================
+# INIT PAYMENT (FLUTTER → BACKEND)
+# ==========================================================
+
+@router.post("/init")
+def init_payment(payload: PaystackInitRequest):
+    # print("🚨🚨🚨 INIT ROUTE HIT 🚨🚨🚨")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    # reference = f"FUND-{uuid.uuid4().hex}"
+    reference = str(uuid.uuid4())
+    print("🔥 INIT CALLED")
+    print("🧾 GENERATED REFERENCE:", reference)
+
+    response = requests.post(
+        PAYSTACK_INIT_URL,
+        headers=HEADERS,
+        json={
+            "email": payload.email,
+            "amount": int(payload.amount * 100),  # Kobo
+            "reference": reference,
+            "metadata": {
+                "user_id": payload.user_id,
+                "purpose": "wallet_funding",
+            },
+        },
+        timeout=30,
+    )
+
+    data = response.json()
+
+    if not data.get("status"):
+        raise HTTPException(
+            status_code=400,
+            detail=data.get("message", "Paystack init failed"),
+        )
+    # print("💥 PAYSTACK INIT RESPONSE:", data)
+
+    # 📝 Save pending transaction
+    # insert_result = transactions_collection.insert_one({
+    transactions_collection.insert_one({
+        "reference": reference,
+        "user_id": payload.user_id,
+        "amount": payload.amount,
+        "type": "wallet_funding",
+        "status": "pending",
+        "created_at": datetime.utcnow(),
+    })
+    # print("✅ INSERTED ID:", insert_result.inserted_id)
+
+    # Immediately confirm it exists
+    check_tx = transactions_collection.find_one({"reference": reference})
+    # print("🔎 CHECK AFTER INSERT:", check_tx)
+    # print("✅ TRANSACTION SAVED TO DB")
+    return {
+        "checkout_url": data["data"]["authorization_url"],
+        "reference": reference,
+    }
+
+# ==========================================================
+# VERIFY PAYMENT (FLUTTER → BACKEND)
+# ==========================================================
+
+# @router.get("/verify/{reference}")
+# def verify_payment(reference: str):
+#     tx = transactions_collection.find_one({"reference": reference})
+
+#     if not tx:
+#         raise HTTPException(status_code=404, detail="Transaction not found")
+
+#     if tx["status"] == "success":
+#         return {
+#             "status": "already_verified",
+#             "balance": get_wallet_balance(tx["user_id"]),
+#         }
+
+#     response = requests.get(
+#         f"{PAYSTACK_VERIFY_URL}{reference}",
+#         headers=HEADERS,
+#         timeout=30,
+#     )
+
+#     data = response.json()
+
+#     if not data.get("status"):
+#         raise HTTPException(status_code=400, detail="Verification failed")
+
+#     paystack_data = data["data"]
+
+#     if paystack_data["status"] != "success":
+#         raise HTTPException(status_code=400, detail="Payment not successful")
+
+#     amount = paystack_data["amount"] / 100
+#     user_id = paystack_data["metadata"]["user_id"]
+
+#     credit_wallet(user_id, amount, reference)
+
+#     return {
+#         "status": "success",
+#         "amount": amount,
+#         "balance": get_wallet_balance(user_id),
+#     }
+@router.get("/verify/{reference}")
+def verify_payment(reference: str):
+    print("🔎 VERIFY CALLED")
+    print("🔎 REFERENCE RECEIVED:", reference)
+    tx = transactions_collection.find_one({"reference": reference})
+
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if tx["status"] == "success":
+        return {
+            "status": "already_verified",
+            "balance": get_wallet_balance(tx["user_id"]),
+        }
+
+    try:
+        response = requests.get(
+            f"{PAYSTACK_VERIFY_URL}{reference}",
+            headers=HEADERS,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException:
+        raise HTTPException(
+            status_code=500,
+            detail="Payment verification service unavailable"
+        )
+
+    if not data.get("status"):
+        raise HTTPException(status_code=400, detail="Verification failed")
+
+    paystack_data = data["data"]
+
+    if paystack_data["status"] != "success":
+        raise HTTPException(status_code=400, detail="Payment not successful")
+
+    amount = paystack_data["amount"] / 100
+    user_id = paystack_data["metadata"]["user_id"]
+    print("USER ID FROM PAYSTACK:", user_id)
+    print("USER ID FROM TX:", tx["user_id"])
+
+    # Validate user
+    if user_id != tx["user_id"]:
+        raise HTTPException(status_code=400, detail="User mismatch detected")
+
+    # Validate amount
+    if amount != tx["amount"]:
+        raise HTTPException(status_code=400, detail="Amount mismatch detected")
+
+    # Credit wallet
+    credit_wallet(user_id, amount, reference)
+
+    # Update transaction status
+    transactions_collection.update_one(
+        {"reference": reference},
+        {"$set": {"status": "success"}}
+    )
+
+    # 🔥 ADD LEDGER ENTRY (Wallet History)
+    # transactions_collection.insert_one({
+    #     "user_id": user_id,
+    #     "title": "Wallet Funding",
+    #     "amount": amount,
+    #     "type": "credit",
+    #     "status": "success",
+    #     "reference": reference,
+    #     "created_at": datetime.utcnow()
+    # })
+
+    return {
+        "status": "success",
+        "amount": amount,
+        "balance": get_wallet_balance(user_id),
+    }
+
+
+# ==========================================================
+# login authentitication
+# ==========================================================
+
+
+# class LoginRequest(BaseModel):
+#     email: str
+#     password: str
+
+# @router.post("/auth/login")
+# def login(data: LoginRequest):
+#     user = users_collection.find_one({"email": data.email})
+
+#     if not user:
+#         raise HTTPException(status_code=401, detail="Invalid credentials")
+#      # In production you would verify hashed password
+#     if user["password"] != data.password:
+#         raise HTTPException(status_code=401, detail="Invalid credentials")
+#     return {
+#         "user_id": user["user_id"],
+#         "email": user["email"],
+#         "token": "demo_token_123"
+#     }
+# ==========================================================
+# PAYSTACK WEBHOOK (PAYSTACK → BACKEND)
+# ==========================================================
+@router.post("/webhook")
+async def paystack_webhook(
+    request: Request,
+    x_paystack_signature: str = Header(None),
+):
+    body = await request.body()
+
+    computed_signature = hmac.new(
+        PAYSTACK_SECRET_KEY.encode(),
+        body,
+        hashlib.sha512,
+    ).hexdigest()
+
+    if x_paystack_signature != computed_signature:
+        return {"status": "invalid_signature"}
+
+    payload = json.loads(body)
+
+    if payload.get("event") != "charge.success":
+        return {"status": "ignored"}
+
+    data = payload.get("data", {})
+
+    reference = data.get("reference")
+    amount = data.get("amount", 0) / 100
+    metadata = data.get("metadata", {})
+    user_id = metadata.get("user_id")
+
+    if not reference or not user_id:
+        return {"status": "invalid_payload"}
+
+    if payment_already_processed(reference):
+        return {"status": "duplicate"}
+
+    credit_wallet(user_id, amount, reference)
+
+    return {"status": "success"}
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def payment_already_processed(reference: str) -> bool:
+    tx = transactions_collection.find_one({"reference": reference})
+    return tx and tx["status"] == "success"
+
+def credit_wallet(user_id: str, amount: float, reference: str):
+    wallets_collection.find_one_and_update(
+        {"_id": user_id},
+        {
+            "$inc": {"balance": amount},
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+
+    transactions_collection.update_one(
+        {"reference": reference},
+        {
+            "$set": {
+                "status": "success",
+                "credited_at": datetime.utcnow(),
+            }
+        },
+    )
+
+    print(f"✅ Wallet credited ₦{amount} | user={user_id}")
+
+def get_wallet_balance(user_id: str) -> float:
+    wallet = wallets_collection.find_one({"_id": user_id})
+    return wallet.get("balance", 0.0) if wallet else 0.0

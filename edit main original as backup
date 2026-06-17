@@ -1,0 +1,1224 @@
+from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+import os
+from dotenv import load_dotenv
+import uuid
+from routes.auth_routes import router as auth_router
+from routes.paystack import router as paystack_router
+from routes.wallet import router as wallet_router
+from datetime import datetime
+from services.vtpass_service import process_vtpass_payment
+from dependencies.auth import get_current_user
+
+from services.wallet import debit_wallet
+from db.db import transactions_collection, wallets_collection, users_collection, db
+
+
+# ======================================================
+# 🌱 ENV
+# ======================================================
+load_dotenv()
+
+app = FastAPI(
+    title="Paying App Backend",
+    description="Wallet + Paystack + VTpass Backend",
+    version="1.0.0"
+)
+
+# ======================================================
+# 🌐 CORS (Flutter Friendly)
+# ======================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ======================================================
+# 🔍 HEALTH CHECK
+# ======================================================
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+# ======================================================
+# 🔐 VTpass KEYS
+# ======================================================
+# VT_API_KEY     = "be9281d94407702f3fee352a3612c767"
+# VT_PUBLIC_KEY  = "PK_68502df9d3fd58a08793de4a2d38515101bbb388921"
+# VT_SECRET_KEY  = "SK_912c4f22fa6e64f022799abbf2831d38c30e54189b7"
+
+VT_API_KEY = os.getenv("VT_API_KEY")
+VT_PUBLIC_KEY = os.getenv("VT_PUBLIC_KEY")
+VT_SECRET_KEY = os.getenv("VT_SECRET_KEY")
+
+HEADERS = {
+    "api-key": VT_API_KEY,
+    "public-key": VT_PUBLIC_KEY,
+    "secret-key": VT_SECRET_KEY,
+    "Content-Type": "application/json",
+}
+
+# ======================================================
+# 💼 WALLET ENDPOINTS
+# ======================================================
+# @app.get("/wallet/{user_id}")
+
+# def get_wallet(user_id: str):
+@app.get("/wallet")
+def get_wallet(user=Depends(get_current_user)):
+
+    user_id = user["user_id"]
+    wallet = wallets_collection.find_one({"_id": user_id})
+    # wallet = wallets_collection.find_one({"user_id": user_id})
+
+    if not wallet:
+        # If wallet doesn't exist, create it
+        wallets_collection.insert_one({
+            "_id": user_id, 
+            # "user_id": user_id,
+            "balance": 0.0
+        })
+        return {"balance": 0.0}
+
+    return {"balance": wallet.get("balance", 0.0)}
+
+# @app.get("/ledger/{user_id}")
+# def get_ledger(user_id: str):
+#     return {
+#         "total_credit": 20000.00,
+#         "total_debit": 7500.00,
+#         "transactions": [
+#             {
+#                 "title": "MTN Data",
+#                 "amount": -100,
+#                 "date": "2025-09-01"
+#             },
+#             {
+#                 "title": "Wallet Funding",
+#                 "amount": 5000,
+#                 "date": "2025-08-30"
+#             }
+#         ]
+#     }
+
+# @app.get("/ledger/{user_id}")
+# def get_ledger(user_id: str):
+
+#     txs = list(
+#         transactions_collection.find(
+#             {"user_id": user_id}
+#         ).sort("created_at", -1)
+#     )
+
+#     transactions = []
+
+#     for tx in txs:
+#         transactions.append({
+#             "title": tx.get("title"),
+#             "amount": tx.get("amount"),
+#             "date": tx.get("created_at").strftime("%Y-%m-%d")
+#         })
+
+#     return {
+#         "transactions": transactions
+#     }
+@app.get("/ledger")
+def get_wallet(user=Depends(get_current_user)):
+
+    user_id = user["user_id"]
+# def get_ledger(user_id: str):
+
+
+    txs = list(
+        transactions_collection.find(
+            {"user_id": user_id}
+        ).sort("created_at", -1)
+    )
+
+    transactions = []
+
+    for tx in txs:
+        transactions.append({
+            "reference": tx.get("reference"),
+            "title": tx.get("title"),
+            "network": tx.get("network", ""),
+            "phone": tx.get("phone", ""),
+            "plan_name": tx.get("plan_name", ""),
+            "amount": tx.get("amount"),
+            "date": tx.get("created_at").isoformat(),
+            "type": tx.get("type", "credit"),
+            "status": tx.get("status", "success")
+        })
+
+    return {
+        "transactions": transactions
+    }
+
+# ======================================================
+# 💳 PAYSTACK INIT (WEBVIEW FLOW)
+# ======================================================
+class PaystackInitRequest(BaseModel):
+    user_id: str
+    email: str
+    amount: float
+
+@app.post("/paystack/init")
+def init_paystack_payment(req: PaystackInitRequest):
+
+    url = "https://api.paystack.co/transaction/initialize"
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET}",
+        "Content-Type": "application/json",
+    }
+
+    reference = str(uuid.uuid4())
+
+    payload = {
+        "email": req.email,
+        "amount": int(req.amount * 100),  # Paystack uses kobo
+        "reference": reference,
+
+        # ✅ THIS IS WHERE IT GOES
+        "metadata": {
+            "user_id": req.user_id
+        },
+
+        "callback_url": "myapp://success.pay"
+    }
+
+    response = requests.post(url, json=payload, headers=headers)
+    res = response.json()
+
+    if not res.get("status"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+
+    return {
+        "authorization_url": res["data"]["authorization_url"],
+        "reference": res["data"]["reference"]
+    }
+
+
+PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
+
+# ======================================================
+# 📶 GET DATA PLANS (VTPASS)
+# ======================================================
+@app.get("/data-plans")
+def get_data_plans(network: str = Query(..., description="mtn, glo, airtel, 9mobile")):
+
+    service_id = f"{network.lower()}-data"
+
+    try:
+        r = requests.get(
+            "https://sandbox.vtpass.com/api/service-variations",
+            params={"serviceID": service_id},
+            headers=HEADERS,
+            timeout=20
+        )
+
+        variations = r.json().get("content", {}).get("variations", [])
+
+        return {
+            "content": {
+                "variations": [
+                    {
+                        "variation_code": v.get("variation_code"),
+                        "name": v.get("name"),
+                        "variation_amount": v.get("variation_amount"),
+                    }
+                    for v in variations
+                ]
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ======================================================
+# 📌 BUY AIRTIME (VTPASS)
+# ======================================================
+
+# class AirtimeRequest(BaseModel):
+#     user_id: str
+#     network: str
+#     phone: str
+#     amount: float
+
+
+# @app.post("/buy-airtime")
+# def buy_airtime(req: AirtimeRequest):
+
+#     return process_vtpass_payment(
+#         user_id=req.user_id,
+#         service_id=req.network.lower(),  # mtn, glo
+#         billers_code=req.phone,
+#         variation_code="",  # airtime doesn't need variation
+#         phone=req.phone,
+#         amount=req.amount
+#     )
+# ======================================================
+# 📞 BUY AIRTIME (VTPASS)
+# ======================================================
+
+class BuyAirtimeRequest(BaseModel):
+    user_id: str
+    network: str   # mtn, glo, airtel, 9mobile
+    phone: str
+    amount: float
+
+
+@app.post("/buy-airtime")
+def buy_airtime(req: BuyAirtimeRequest):
+
+    service_id = f"{req.network.lower()}"
+
+    try:
+        print("📞 STEP 1: Airtime request received")
+
+        amount = float(req.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Invalid amount")
+
+        # 2️⃣ CHECK WALLET
+        wallet = wallets_collection.find_one({"_id": req.user_id})
+
+        print("📞 STEP 2: Wallet check")
+        print("USER:", req.user_id)
+        print("WALLET:", wallet)
+        print("AMOUNT:", amount)
+
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        balance = wallet.get("balance", 0)
+
+        if balance < amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        # 3️⃣ DEBIT WALLET
+        reference = "airtime_" + os.urandom(6).hex()
+
+        wallets_collection.update_one(
+            {"_id": req.user_id},
+            {"$inc": {"balance": -amount}}
+        )
+
+        print("📞 STEP 3: Wallet debited")
+
+        # 4️⃣ CALL VTPASS
+        print("📞 STEP 4: Calling VTPASS")
+
+        payload = {
+            "request_id": reference,
+            "serviceID": service_id,   # e.g. mtn, glo
+            "amount": amount,
+            "phone": req.phone
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/pay",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        vt = response.json()
+
+        print("📞 VT RESPONSE:", vt)
+
+        # 5️⃣ CHECK SUCCESS
+        code = str(vt.get("code", "")).strip()
+        desc = vt.get("response_description", "").strip().upper()
+
+        is_success = (
+            code == "000" or
+            desc == "TRANSACTION SUCCESSFUL"
+        )
+
+        print("📞 SUCCESS:", is_success)
+
+        # ================= SUCCESS =================
+        if is_success:
+            print("✅ Saving SUCCESS airtime transaction")
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "network": req.network,
+                "phone": req.phone,
+                "plan_name": "Airtime Purchase",
+                "status": "success",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "success",
+                "reference": reference,
+                "vtpass_response": vt
+            }
+
+        # ================= FAILURE =================
+        else:
+            print("❌ Airtime failed → refunding")
+
+            # REFUND
+            wallets_collection.update_one(
+                {"_id": req.user_id},
+                {"$inc": {"balance": amount}}
+            )
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "network": req.network,
+                "phone": req.phone,
+                "plan_name": "Airtime Purchase",
+                "status": "failed",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "failed",
+                "message": vt.get("response_description", "Transaction failed"),
+                "vtpass_response": vt
+            }
+
+    except Exception as e:
+        print("🔥 ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ======================================================
+# 📌 BUY CABLE(VTPASS)
+# ======================================================
+
+# class CableRequest(BaseModel):
+#     user_id: str
+#     provider: str   # dstv
+#     smartcard: str
+#     package: str
+#     phone: str
+
+
+# @app.post("/buy-cable")
+# def buy_cable(req: CableRequest):
+
+#     return process_vtpass_payment(
+#         user_id=req.user_id,
+#         service_id=req.provider,
+#         billers_code=req.smartcard,
+#         variation_code=req.package,
+#         phone=req.phone,
+#         amount=0  # will be handled via variation lookup
+#     )
+
+ #======================================================
+# 📌 BUY GOTV (VTPASS)
+# ======================================================
+# @app.post("/buy-gotv")
+# def buy_gotv(req: CableRequest):
+
+#     return process_vtpass_payment(
+#         user_id=req.user_id,
+#         service_id="gotv",
+#         billers_code=req.smartcard,
+#         variation_code=req.package,
+#         phone=req.phone,
+#         amount=0
+#     )
+
+# ======================================================
+# 📺 VERIFY CABLE (SMARTCARD / IUC)
+# ======================================================
+
+class VerifyCableRequest(BaseModel):
+    service: str        # dstv, gotv, startimes
+    smartcard_number: str
+
+
+@app.post("/verify-cable")
+def verify_cable(req: VerifyCableRequest):
+
+    try:
+        print("📺 STEP 1: Verifying smartcard")
+
+        payload = {
+            "billersCode": req.smartcard_number,
+            "serviceID": req.service
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/merchant-verify",
+            json=payload,
+            headers=HEADERS,
+            timeout=20
+        )
+
+        data = response.json()
+        print("📺 VERIFY RESPONSE:", data)
+
+        if data.get("code") != "000":
+            raise HTTPException(
+                status_code=400,
+                detail=data.get("response_description", "Verification failed")
+            )
+
+        return {
+            "status": "success",
+            "customer_name": data["content"]["Customer_Name"],
+            "smartcard_number": req.smartcard_number,
+            "service": req.service
+        }
+
+    except Exception as e:
+        print("🔥 VERIFY ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ======================================================
+# 📺 GET CABLE PLANS
+# ======================================================
+
+@app.get("/cable-plans")
+def get_cable_plans(service: str):
+
+    try:
+        print("📺 Fetching cable plans")
+
+        r = requests.get(
+            "https://sandbox.vtpass.com/api/service-variations",
+            params={"serviceID": service},
+            headers=HEADERS,
+            timeout=20
+        )
+
+        variations = r.json().get("content", {}).get("variations", [])
+
+        return {
+            "plans": [
+                {
+                    "variation_code": v.get("variation_code"),
+                    "name": v.get("name"),
+                    "amount": v.get("variation_amount"),
+                }
+                for v in variations
+            ]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ======================================================
+# 📺 BUY CABLE SUBSCRIPTION
+# ======================================================
+
+class BuyCableRequest(BaseModel):
+    user_id: str
+    service: str              # dstv, gotv, startimes
+    smartcard_number: str
+    variation_code: str       # bouquet
+    phone: str
+
+
+@app.post("/buy-cable")
+def buy_cable(req: BuyCableRequest):
+
+    try:
+        print("📺 STEP 1: Fetching plans")
+
+        # 1️⃣ FETCH PLANS
+        r = requests.get(
+            "https://sandbox.vtpass.com/api/service-variations",
+            params={"serviceID": req.service},
+            headers=HEADERS,
+            timeout=20
+        )
+
+        variations = r.json().get("content", {}).get("variations", [])
+
+        selected = next(
+            (v for v in variations if v["variation_code"] == req.variation_code),
+            None
+        )
+
+        if not selected:
+            raise HTTPException(status_code=400, detail="Invalid bouquet")
+
+        amount = float(selected["variation_amount"])
+
+        # ================= WALLET CHECK =================
+        wallet = wallets_collection.find_one({"_id": req.user_id})
+
+        print("📺 STEP 2: Wallet check")
+        print("USER:", req.user_id)
+        print("WALLET:", wallet)
+        print("AMOUNT:", amount)
+
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        if wallet.get("balance", 0) < amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        # ================= DEBIT WALLET =================
+        reference = "cable_" + os.urandom(6).hex()
+
+        wallets_collection.update_one(
+            {"_id": req.user_id},
+            {"$inc": {"balance": -amount}}
+        )
+
+        print("📺 STEP 3: Wallet debited")
+
+        # ================= CALL VTPASS =================
+        print("📺 STEP 4: Calling VTPASS")
+
+        payload = {
+            "request_id": reference,
+            "serviceID": req.service,
+            "billersCode": req.smartcard_number,
+            "variation_code": req.variation_code,
+            "amount": amount,
+            "phone": req.phone
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/pay",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        vt = response.json()
+
+        print("📺 VT RESPONSE:", vt)
+
+        # ================= CHECK SUCCESS =================
+        code = str(vt.get("code", "")).strip()
+        desc = vt.get("response_description", "").strip().upper()
+
+        is_success = (
+            code == "000" or
+            desc == "TRANSACTION SUCCESSFUL"
+        )
+
+        print("📺 SUCCESS:", is_success)
+
+        # ================= SUCCESS =================
+        if is_success:
+            print("✅ Saving cable transaction")
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "service": req.service,
+                "smartcard_number": req.smartcard_number,
+                "plan_name": selected.get("name"),
+                "status": "success",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "success",
+                "reference": reference,
+                "vtpass_response": vt
+            }
+
+        # ================= FAILURE =================
+        else:
+            print("❌ Cable failed → refunding")
+
+            wallets_collection.update_one(
+                {"_id": req.user_id},
+                {"$inc": {"balance": amount}}
+            )
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "service": req.service,
+                "smartcard_number": req.smartcard_number,
+                "plan_name": selected.get("name"),
+                "status": "failed",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "failed",
+                "message": vt.get("response_description", "Transaction failed"),
+                "vtpass_response": vt
+            }
+
+    except Exception as e:
+        print("🔥 CABLE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+# ======================================================
+# ⚡ VERIFY ELECTRICITY METER
+# ======================================================
+
+class VerifyMeterRequest(BaseModel):
+    service: str   # ikeja-electric, eko-electric, etc.
+    meter_number: str
+    meter_type: str  # prepaid or postpaid
+
+
+@app.post("/verify-meter")
+def verify_meter(req: VerifyMeterRequest):
+
+    try:
+        print("⚡ STEP 1: Verifying meter")
+
+        payload = {
+            "billersCode": req.meter_number,
+            "serviceID": req.service,
+            "type": req.meter_type,
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/merchant-verify",
+            json=payload,
+            headers=HEADERS,
+            timeout=20
+        )
+
+        data = response.json()
+        print("⚡ VERIFY RESPONSE:", data)
+
+        if data.get("code") != "000":
+            raise HTTPException(
+                status_code=400,
+                detail=data.get("response_description", "Verification failed")
+            )
+
+        return {
+            "status": "success",
+            "customer_name": data["content"]["Customer_Name"],
+            "meter_number": req.meter_number,
+            "service": req.service
+        }
+
+    except Exception as e:
+        print("🔥 VERIFY ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+# ======================================================
+# 📌 BUY ELECTRICITY (VTPASS)
+# ======================================================
+
+# class ElectricityRequest(BaseModel):
+#     user_id: str
+#     disco: str
+#     meter_number: str
+#     meter_type: str  # prepaid/postpaid
+#     amount: float
+#     phone: str
+
+
+# @app.post("/buy-electricity")
+# def buy_electricity(req: ElectricityRequest):
+
+#     return process_vtpass_payment(
+#         user_id=req.user_id,
+#         service_id=req.disco,
+#         billers_code=req.meter_number,
+#         variation_code=req.meter_type,
+#         phone=req.phone,
+#         amount=req.amount
+#     )
+
+
+# ======================================================
+# ⚡ BUY ELECTRICITY
+# ======================================================
+
+class BuyElectricityRequest(BaseModel):
+    user_id: str
+    service: str        # ikeja-electric, eko-electric
+    meter_number: str
+    meter_type: str     # prepaid/postpaid
+    amount: float
+    phone: str
+
+
+@app.post("/buy-electricity")
+def buy_electricity(req: BuyElectricityRequest):
+
+    try:
+        print("⚡ STEP 1: Electricity purchase started")
+
+        amount = float(req.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Invalid amount")
+
+        # ================= WALLET CHECK =================
+        wallet = wallets_collection.find_one({"_id": req.user_id})
+
+        print("⚡ STEP 2: Wallet check")
+        print("USER:", req.user_id)
+        print("WALLET:", wallet)
+        print("AMOUNT:", amount)
+
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        if wallet.get("balance", 0) < amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        # ================= DEBIT WALLET =================
+        reference = "elec_" + os.urandom(6).hex()
+
+        wallets_collection.update_one(
+            {"_id": req.user_id},
+            {"$inc": {"balance": -amount}}
+        )
+
+        print("⚡ STEP 3: Wallet debited")
+
+        # ================= CALL VTPASS =================
+        print("⚡ STEP 4: Calling VTPASS")
+
+        payload = {
+            "request_id": reference,
+            "serviceID": req.service,
+            "billersCode": req.meter_number,
+            "variation_code": req.meter_type,  # prepaid/postpaid
+            "amount": amount,
+            "phone": req.phone
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/pay",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        vt = response.json()
+
+        print("⚡ VT RESPONSE:", vt)
+
+        # ================= CHECK SUCCESS =================
+        code = str(vt.get("code", "")).strip()
+        desc = vt.get("response_description", "").strip().upper()
+
+        is_success = (
+            code == "000" or
+            desc == "TRANSACTION SUCCESSFUL"
+        )
+
+        print("⚡ SUCCESS:", is_success)
+
+        # ================= SUCCESS =================
+        if is_success:
+            print("✅ Saving electricity transaction")
+
+            token = (
+                vt.get("purchased_code") or
+                vt.get("content", {}).get("transactions", {}).get("token")
+            )
+
+            units = vt.get("content", {}).get("transactions", {}).get("units")
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "service": req.service,
+                "meter_number": req.meter_number,
+                "meter_type": req.meter_type,
+                "token": token,
+                "units": units,
+                "status": "success",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "success",
+                "reference": reference,
+                "token": token,
+                "units": units,
+                "vtpass_response": vt
+            }
+
+        # ================= FAILURE =================
+        else:
+            print("❌ Electricity failed → refunding")
+
+            # REFUND
+            wallets_collection.update_one(
+                {"_id": req.user_id},
+                {"$inc": {"balance": amount}}
+            )
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "service": req.service,
+                "meter_number": req.meter_number,
+                "meter_type": req.meter_type,
+                "status": "failed",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "failed",
+                "message": vt.get("response_description", "Transaction failed"),
+                "vtpass_response": vt
+            }
+
+    except Exception as e:
+        print("🔥 ELECTRICITY ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+ #======================================================
+# 📌 BUY Education (VTPASS)
+# ======================================================
+# class EducationRequest(BaseModel):
+#     user_id: str
+#     service: str  # waec
+#     variation_code: str
+#     phone: str
+
+
+# @app.post("/buy-education")
+# def buy_education(req: EducationRequest):
+
+#     return process_vtpass_payment(
+#         user_id=req.user_id,
+#         service_id=req.service,
+#         billers_code=req.phone,
+#         variation_code=req.variation_code,
+#         phone=req.phone,
+#         amount=0
+#     )
+
+# ======================================================
+# 🎓 BUY EDUCATION (WAEC, NECO, JAMB, NABTEB)
+# ======================================================
+
+class BuyEducationRequest(BaseModel):
+    user_id: str
+    service: str          # waec, neco, jamb, nabteb
+    variation_code: str
+    phone: str
+    quantity: int = 1
+
+
+@app.post("/buy-education")
+def buy_education(req: BuyEducationRequest):
+
+    service_id = req.service.lower()
+
+    try:
+        print("🎓 STEP 1: Fetching variations")
+
+        # 1️⃣ FETCH VARIATIONS
+        r = requests.get(
+            "https://sandbox.vtpass.com/api/service-variations",
+            params={"serviceID": service_id},
+            headers=HEADERS,
+            timeout=20
+        )
+
+        variations = r.json().get("content", {}).get("variations", [])
+
+        selected = next(
+            (v for v in variations if v["variation_code"] == req.variation_code),
+            None
+        )
+
+        if not selected:
+            raise HTTPException(status_code=400, detail="Invalid variation")
+
+        amount = float(selected["variation_amount"])
+        total_amount = amount * req.quantity
+
+        print("🎓 STEP 2: Wallet check")
+
+        # 2️⃣ CHECK WALLET
+        wallet = wallets_collection.find_one({"_id": req.user_id})
+
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        balance = wallet.get("balance", 0)
+
+        if balance < total_amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        print("🎓 STEP 3: Debit wallet")
+
+        # 3️⃣ DEBIT WALLET
+        reference = "edu_" + os.urandom(6).hex()
+
+        wallets_collection.update_one(
+            {"_id": req.user_id},
+            {"$inc": {"balance": -total_amount}}
+        )
+
+        print("🎓 STEP 4: Calling VTPASS")
+
+        # 4️⃣ CALL VTPASS
+        payload = {
+            "request_id": reference,
+            "serviceID": service_id,
+            "billersCode": req.phone,
+            "variation_code": req.variation_code,
+            "amount": total_amount,
+            "phone": req.phone,
+            "quantity": req.quantity
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/pay",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        vt = response.json()
+
+        print("🎓 VT RESPONSE:", vt)
+
+        # 5️⃣ CHECK SUCCESS
+        code = str(vt.get("code", "")).strip()
+        desc = vt.get("response_description", "").strip().upper()
+
+        is_success = (
+            code == "000" or
+            desc == "TRANSACTION SUCCESSFUL"
+        )
+
+        print("🎓 SUCCESS:", is_success)
+
+        # ================= SUCCESS =================
+        if is_success:
+            print("✅ Saving SUCCESS transaction")
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": total_amount,
+                "type": "debit",
+                "service": req.service,
+                "phone": req.phone,
+                "plan_name": selected.get("name", "Education Payment"),
+                "quantity": req.quantity,
+                "status": "success",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "success",
+                "reference": reference,
+                "vtpass_response": vt
+            }
+
+        # ================= FAILURE =================
+        else:
+            print("❌ Transaction failed → refunding")
+
+            # REFUND WALLET
+            wallets_collection.update_one(
+                {"_id": req.user_id},
+                {"$inc": {"balance": total_amount}}
+            )
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": total_amount,
+                "type": "debit",
+                "service": req.service,
+                "phone": req.phone,
+                "plan_name": selected.get("name", "Education Payment"),
+                "quantity": req.quantity,
+                "status": "failed",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "failed",
+                "message": vt.get("response_description", "Transaction failed"),
+                "vtpass_response": vt
+            }
+
+    except Exception as e:
+        print("🔥 ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+# ======================================================
+# 📌 BUY DATA (VTPASS)
+# ======================================================
+
+class BuyDataRequest(BaseModel):
+    user_id: str
+    network: str
+    phone: str
+    variation_code: str
+
+    
+
+@app.post("/buy-data")
+def buy_data(req: BuyDataRequest):
+
+    service_id = f"{req.network.lower()}-data"
+    print("✅ STEP 1: Variations fetched")
+    try:
+        # 1️⃣ Fetch variations
+        r = requests.get(
+            "https://sandbox.vtpass.com/api/service-variations",
+            params={"serviceID": service_id},
+            headers=HEADERS,
+            timeout=20
+        )
+
+        variations = r.json().get("content", {}).get("variations", [])
+
+        selected = next(
+            (v for v in variations if v["variation_code"] == req.variation_code),
+            None
+        )
+
+        if not selected:
+            raise HTTPException(status_code=400, detail="Invalid variation code")
+
+        amount = float(selected["variation_amount"])
+
+        # 2️⃣ CHECK WALLET
+        wallet = wallets_collection.find_one({"_id": req.user_id})
+        print("✅ STEP 2: Wallet checked")
+        print("USER:", req.user_id)
+        print("WALLET:", wallet)
+        print("PLAN PRICE:", amount)
+
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+
+        if wallet.get("balance", 0) < amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        # 3️⃣ DEBIT WALLET
+        reference = "data_" + os.urandom(6).hex()
+
+        wallets_collection.update_one(
+            {"_id": req.user_id},
+            {"$inc": {"balance": -amount}}
+        )
+
+        print("✅ STEP 3: Wallet debited")
+
+        print("✅ STEP 4: Calling VTPASS...")
+
+        # 4️⃣ CALL VTPASS
+        payload = {
+            "request_id": reference,
+            "serviceID": service_id,
+            "billersCode": req.phone,
+            "variation_code": req.variation_code,
+            "amount": amount,
+            "phone": req.phone
+        }
+
+        response = requests.post(
+            "https://sandbox.vtpass.com/api/pay",
+            json=payload,
+            headers=HEADERS,
+            timeout=30
+        )
+
+        print("✅ STEP 5: After VTPASS call")
+        vt = response.json()
+
+        print("VT RESPONSE:", vt)
+
+        # 5️⃣ CHECK SUCCESS
+        code = str(vt.get("code", "")).strip()
+        desc = vt.get("response_description", "").strip().upper()
+
+        is_success = (
+            code == "000" or
+            desc == "TRANSACTION SUCCESSFUL"
+        )
+
+        print("IS SUCCESS:", is_success)
+
+        # ================= SUCCESS =================
+        if is_success:
+            print("✅ Saving SUCCESS transaction")
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "network": req.network,
+                "phone": req.phone,
+                "plan_name": selected.get("name", "Data Purchase"),
+                "status": "success",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "success",
+                "reference": reference,
+                "vtpass_response": vt
+            }
+
+        # ================= FAILURE =================
+        else:
+            print("❌ Transaction failed, refunding")
+
+            # refund
+            wallets_collection.update_one(
+                {"_id": req.user_id},
+                {"$inc": {"balance": amount}}
+            )
+
+            transactions_collection.insert_one({
+                "user_id": req.user_id,
+                "reference": reference,
+                "amount": amount,
+                "type": "debit",
+                "network": req.network,
+                "phone": req.phone,
+                "plan_name": selected.get("name", "Data Purchase"),
+                "status": "failed",
+                "created_at": datetime.utcnow()
+            })
+
+            return {
+                "status": "failed",
+                "message": vt.get("response_description", "Transaction failed"),
+                "vtpass_response": vt
+            }
+
+    except Exception as e:
+        print("🔥 ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug-wallets")
+def debug_wallets():
+    wallets = list(wallets_collection.find())
+    return wallets
+
+app.include_router(auth_router)
+app.include_router(paystack_router)
+app.include_router(wallet_router)

@@ -1,0 +1,54 @@
+# class BuyDataRequest(BaseModel):
+#     network: str
+#     phone: str
+#     variation_code: str
+
+# @app.post("/buy-data")
+# def buy_data(req: BuyDataRequest):
+
+#     service_id = f"{req.network.lower()}-data"
+
+#     try:
+#         # Fetch variations
+#         r = requests.get(
+#             "https://sandbox.vtpass.com/api/service-variations",
+#             params={"serviceID": service_id},
+#             headers=HEADERS,
+#             timeout=20
+#         )
+
+#         variations = r.json().get("content", {}).get("variations", [])
+
+#         selected = next(
+#             (v for v in variations if v["variation_code"] == req.variation_code),
+#             None
+#         )
+
+#         if not selected:
+#             raise HTTPException(status_code=400, detail="Invalid variation code")
+
+#         amount = selected["variation_amount"]
+
+#         payload = {
+#             "request_id": "req_" + os.urandom(6).hex(),
+#             "serviceID": service_id,
+#             "billersCode": req.phone,
+#             "variation_code": req.variation_code,
+#             "amount": amount,
+#             "phone": req.phone
+#         }
+
+#         response = requests.post(
+#             "https://sandbox.vtpass.com/api/pay",
+#             json=payload,
+#             headers=HEADERS,
+#             timeout=30
+#         )
+
+#         return {
+#             "status": "success",
+#             "vtpass_response": response.json()
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))

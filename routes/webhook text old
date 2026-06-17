@@ -1,0 +1,47 @@
+import hashlib
+import hmac
+import os
+from fastapi import APIRouter, Request, Header, HTTPException
+from services.wallet import credit_wallet
+
+router = APIRouter()
+
+PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
+
+def verify_signature(body: bytes, signature: str):
+    computed = hmac.new(
+        PAYSTACK_SECRET.encode(),
+        body,
+        hashlib.sha512,
+    ).hexdigest()
+
+    return hmac.compare_digest(computed, signature)
+
+
+@router.post("/paystack/webhook")
+async def paystack_webhook(
+    request: Request,
+    x_paystack_signature: str = Header(None),
+):
+    body = await request.body()
+
+    if not verify_signature(body, x_paystack_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    payload = await request.json()
+    event = payload.get("event")
+    data = payload.get("data")
+
+    # ✅ PAYMENT SUCCESS
+    if event == "charge.success":
+        reference = data["reference"]
+        amount = data["amount"] / 100  # Kobo → Naira
+        user_id = data["metadata"]["user_id"]
+
+        await credit_wallet(
+            user_id=user_id,
+            amount=amount,
+            reference=reference,
+        )
+
+    return {"status": "ok"}
